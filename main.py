@@ -1,11 +1,48 @@
 import aiohttp
 import uvicorn
-from fastai.callbacks import *
 from fastai.vision import *
 from starlette.applications import Starlette
 from starlette.responses import Response, HTMLResponse, RedirectResponse
-from torchvision.models import vgg16_bn
-from FeatureLoss import FLRunner
+
+from fastai.callbacks import *
+from fastai.utils.mem import *
+
+
+def gram_matrix(x):
+    n, c, h, w = x.size()
+    x = x.view(n, c, -1)
+    return (x @ x.transpose(1, 2)) / (c * h * w)
+
+
+base_loss = F.l1_loss
+
+
+class FeatureLoss(nn.Module):
+    def __init__(self, m_feat, layer_ids, layer_wgts):
+        super().__init__()
+        self.m_feat = m_feat
+        self.loss_features = [self.m_feat[i] for i in layer_ids]
+        self.hooks = hook_outputs(self.loss_features, detach=False)
+        self.wgts = layer_wgts
+        self.metric_names = ['pixel', ] + [f'feat_{i}' for i in range(len(layer_ids))
+                                           ] + [f'gram_{i}' for i in range(len(layer_ids))]
+
+    def make_features(self, x, clone=False):
+        self.m_feat(x)
+        return [(o.clone() if clone else o) for o in self.hooks.stored]
+
+    def forward(self, input, target):
+        out_feat = self.make_features(target, clone=True)
+        in_feat = self.make_features(input)
+        self.feat_losses = [base_loss(input, target)]
+        self.feat_losses += [base_loss(f_in, f_out) * w
+                             for f_in, f_out, w in zip(in_feat, out_feat, self.wgts)]
+        self.feat_losses += [base_loss(gram_matrix(f_in), gram_matrix(f_out)) * w ** 2 * 5e3
+                             for f_in, f_out, w in zip(in_feat, out_feat, self.wgts)]
+        self.metrics = dict(zip(self.metric_names, self.feat_losses))
+        return sum(self.feat_losses)
+
+    def __del__(self): self.hooks.remove()
 
 
 async def get_bytes(url):
@@ -34,25 +71,19 @@ async def classify_url(request):
 def predict_image_from_bytes(imgbytes, filename=""):
     path = Path('data/images')
     img = PIL.Image.open(BytesIO(imgbytes))
+    # TODO: find the image's extension and use it everywhere
+    # TODO: test if .pkl works better
+    # TODO: figure out what the windowsPath error is (different python/pytorch versions? path issue?)
     if len(filename) > 0:
         img.filename = filename
     else:
         img.filename = 'url_picture.jpeg'
     img.save(path / img.filename)
-    src = ImageImageList.from_folder(path).split_by_rand_pct(0.1, seed=42)
-    imgdata = (src.label_from_func(lambda x: path / x.name).transform(get_transforms(), size=(img.size[1], img.size[0]),
-                                                                      tfm_y=True).databunch(bs=1).normalize(
-        imagenet_stats, do_y=True))
-    arch = models.resnet34
-    wd = 1e-3
-    vgg_m = vgg16_bn(True).features.eval()
-    blocks = [i - 1 for i, o in enumerate(children(vgg_m)) if isinstance(o, nn.MaxPool2d)]
-    requires_grad(vgg_m, False)
-    feat_loss = partial(FLRunner, vgg_m, blocks[2:5], [5, 15, 2])
-    learn = unet_learner(imgdata, arch, wd=wd, loss_func=feat_loss, callback_fns=LossMetrics, blur=True,
-                         norm_type=NormType.Weight)
-    learn.path = Path('data')
-    learn.load('rezolute256')
+    src = ImageImageList.from_folder(path).split_none()
+    imgdata = (src.label_from_func(lambda x: path / x.name).transform(get_transforms(), size=(
+        img.size[1], img.size[0]), tfm_y=True).databunch(bs=1).normalize(imagenet_stats, do_y=True))
+    learn = load_learner("data", "rezolute256.pkl")
+    learn.data = imgdata
     fastimg = open_image(BytesIO(imgbytes))
     fastimg.save(path / 'fastimg.jpeg')
     pred = learn.predict(fastimg)[0]
@@ -60,8 +91,8 @@ def predict_image_from_bytes(imgbytes, filename=""):
     img_bytes = BytesIO()
     pred.save_with_format(img_bytes, format='jpeg')
     # comment these lines out if you want to save the image
-    for f in os.listdir(path):
-        os.remove(path / f)
+    # for f in os.listdir(path):
+    #    os.remove(path / f)
     learn.destroy()
 
     return Response(img_bytes.getvalue(), media_type='image/jpeg')
@@ -90,5 +121,4 @@ def redirect_to_homepage(request):
 
 
 if __name__ == "__main__":
-    if "serve" in sys.argv:
-        uvicorn.run(app, host="0.0.0.0", port=8008)
+    uvicorn.run(app, host="127.0.0.1", port=5000, log_level="info")
